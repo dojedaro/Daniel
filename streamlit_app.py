@@ -26,3 +26,12 @@ def query(payload, direction):
         return response.json()[0]["translation_text"]
     else:
         return f"Error: {response.status_code} — Try again later."
+
+# UI
+st.title("English ↔ Korean Translator")
+direction = st.radio("Select translation direction", ["English → Korean", "Korean → English"])
+text = st.text_area("Enter your text:")
+if st.button("Translate"):
+    if text.strip():
+        result = query(text, direction)
+        st.success(result)
