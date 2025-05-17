@@ -19,7 +19,6 @@ API_URLS = {
     "English → Korean": "https://api-inference.huggingface.co/models/Helsinki-NLP/opus-mt-en-ko",
     "Korean → English": "https://api-inference.huggingface.co/models/Helsinki-NLP/opus-mt-ko-en",
 }
-
 def query(payload, direction):
     response = requests.post(API_URLS[direction], headers=headers, json={"inputs": payload})
     if response.status_code == 200:
