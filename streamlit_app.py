@@ -16,10 +16,3 @@ def query(payload, direction):
         return response.json()[0]["translation_text"]
     else:
         return f"Error: {response.status_code} — Try again later."
-
-if st.button("Translate"):
-    if text.strip() == "":
-        st.warning("Please enter some text.")
-    else:
-        result = query(text, direction)
-        st.success(result)
