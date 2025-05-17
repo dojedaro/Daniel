@@ -1,6 +1,16 @@
 import streamlit as st
 import requests
 
+try:
+    # your existing imports and logic here
+    HF_TOKEN = st.secrets["HF_TOKEN"]
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+
+except Exception as e:
+    st.error("⚠️ App crashed:")
+    st.code(traceback.format_exc())
+    st.stop()
+
 HF_TOKEN = st.secrets["HF_TOKEN"]
 
 headers = {"Authorization": f"Bearer {HF_TOKEN}"}
