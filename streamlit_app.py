@@ -1,19 +1,31 @@
 import streamlit as st
-from transformers import pipeline
+import requests
 
 st.set_page_config(page_title="EN ↔ KO Translator")
 
-en2ko = pipeline("translation_en_to_ko", model="Helsinki-NLP/opus-mt-en-ko")
-ko2en = pipeline("translation_ko_to_en", model="Helsinki-NLP/opus-mt-ko-en")
+# Hugging Face Inference API URLs
+API_URLS = {
+    "English → Korean": "https://api-inference.huggingface.co/models/Helsinki-NLP/opus-mt-en-ko",
+    "Korean → English": "https://api-inference.huggingface.co/models/Helsinki-NLP/opus-mt-ko-en",
+}
+
+headers = {"Authorization": "Bearer YOUR_HUGGINGFACE_API_KEY"}  # replace or remove if public access
 
 st.title("English ↔ Korean Translator")
 
 direction = st.radio("Select translation direction", ["English → Korean", "Korean → English"])
 text = st.text_area("Enter your text:")
 
-if st.button("Translate"):
-    if direction == "English → Korean":
-        translation = en2ko(text)[0]['translation_text']
+def query(payload, direction):
+    response = requests.post(API_URLS[direction], headers=headers, json={"inputs": payload})
+    if response.status_code == 200:
+        return response.json()[0]["translation_text"]
     else:
-        translation = ko2en(text)[0]['translation_text']
-    st.success(translation)
+        return f"Error: {response.status_code} — Try again later."
+
+if st.button("Translate"):
+    if text.strip() == "":
+        st.warning("Please enter some text.")
+    else:
+        result = query(text, direction)
+        st.success(result)
