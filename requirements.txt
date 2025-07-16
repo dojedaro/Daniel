@@ -1,6 +1,0 @@
-streamlit
-pandas
-plotly
-serpapi
-sentence-transformers
-chromadb
