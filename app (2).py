@@ -2,7 +2,7 @@
 # Research Paper Answer Bot - Simple Deployment Version  
 # Created by: Daniel Ojeda Rosales  
 # ===============================================================================
-
+#updated with debug info
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
