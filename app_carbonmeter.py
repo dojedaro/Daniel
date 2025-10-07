@@ -55,21 +55,60 @@ def load_run_dir(run_dir: Path):
     emissions= pd.read_csv(emissions_p)
     return summary, epochs, samples, emissions
 
+# ---------- LOAD RUNS: from repo (sample_runs/) and/or user uploads ----------
+
+import io, zipfile
+from pathlib import Path
+
+def list_repo_zip_paths():
+    base = Path(__file__).parent / "sample_runs"
+    return sorted(base.glob("*.zip")) if base.exists() else []
+
+def extract_zip_path_to_tmp(zip_path: Path) -> Path:
+    with zipfile.ZipFile(str(zip_path), "r") as zf:
+        out_dir = Path("/tmp") / f"run_{zip_path.stem}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        zf.extractall(out_dir)
+        top = [p for p in out_dir.iterdir() if p.is_dir()]
+        if len(top) == 1 and (top[0] / "summary.json").exists():
+            return top[0]
+        return out_dir
+
+st.caption("Upload one or more *run ZIPs* OR let the app preload any demo ZIPs found under `sample_runs/` in this repo.")
+
+preload_demo = st.toggle("Preload bundled demo runs (sample_runs/)", value=True)
+
 uploads = st.file_uploader("Upload run ZIP(s)", type=["zip"], accept_multiple_files=True)
 
 runs = []
+
+# 1) Preload from repo/sample_runs (if toggle on)
+if preload_demo:
+    repo_zips = list_repo_zip_paths()
+    for zp in repo_zips:
+        try:
+            rd = extract_zip_path_to_tmp(zp)
+            summary, epochs, samples, emissions = load_run_dir(rd)
+            runs.append((rd.name, summary, epochs, samples))
+            st.success(f"Preloaded: sample_runs/{zp.name}")
+        except Exception as e:
+            st.warning(f"Skipped sample_runs/{zp.name}: {e}")
+
+# 2) Also load any user uploads
 if uploads:
     for up in uploads:
         try:
             rd = extract_zip_to_tmp(up)
             summary, epochs, samples, emissions = load_run_dir(rd)
             runs.append((rd.name, summary, epochs, samples))
-            st.success(f"Loaded: {rd}")
+            st.success(f"Loaded upload: {up.name}")
         except Exception as e:
             st.error(f"Failed to load {up.name}: {e}")
 
 if not runs:
+    st.info("No runs loaded yet. Upload ZIP(s) above or enable the preload toggle.")
     st.stop()
+
 
 # Tabs
 tab1, tab2, tab3, tab4 = st.tabs(["Baseline (single run)", "Online vs Offline (Korea)", "Region & PUE (what-if)", "Multi-run overlay"])
