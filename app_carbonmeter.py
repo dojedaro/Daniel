@@ -47,49 +47,43 @@ COUNTRY_COLOR = {"KOR":"#1f77b4","CAN":"#2ca02c","MEX":"#ff7f0e","MNG":"#9467bd"
 def fig_white(size=(7.5,4)):
     return plt.figure(figsize=size, facecolor="white")
 
-def extract_zip_to_tmp(uploaded_zip) -> Path:
-    zbytes = io.BytesIO(uploaded_zip.getvalue())
-    with zipfile.ZipFile(zbytes, "r") as zf:
-        out_dir = Path("/tmp") / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        zf.extractall(out_dir)
-        # If single top-level dir exists, use it
-        top = [p for p in out_dir.iterdir() if p.is_dir()]
-        if len(top) == 1 and (top[0] / "summary.json").exists():
-            return top[0]
-        return out_dir
 
-def load_run_dir(run_dir: Path):
-    summary_p = run_dir / "summary.json"
-    epochs_p  = run_dir / "epochs.csv"
-    samples_p = run_dir / "samples.csv"
-    emissions_p = run_dir / "emissions.csv"
-    for p in [summary_p, epochs_p, samples_p, emissions_p]:
-        if not p.exists(): raise FileNotFoundError(f"Missing {p.name} in {run_dir}")
-    with open(summary_p, "r") as f: summary = json.load(f)
-    epochs   = pd.read_csv(epochs_p)
-    samples  = pd.read_csv(samples_p)
-    emissions= pd.read_csv(emissions_p)
-    return summary, epochs, samples, emissions
-
-# ---------- LOAD RUNS: from repo (sample_runs/) and/or user uploads ----------
-
+# --- Robust ZIP extraction: find the true run root even if nested deeply ---
 import io, zipfile
 from pathlib import Path
 
-def list_repo_zip_paths():
-    base = Path(__file__).parent / "sample_runs"
-    return sorted(base.glob("*.zip")) if base.exists() else []
+REQUIRED_FILES = {"summary.json", "epochs.csv", "samples.csv", "emissions.csv"}
+
+def _find_run_root(extracted_dir: Path) -> Path:
+    # 1) If the files are right at this level
+    names_here = {p.name for p in extracted_dir.iterdir() if p.is_file()}
+    if REQUIRED_FILES.issubset(names_here):
+        return extracted_dir
+    # 2) Otherwise, search all subfolders for a directory containing all files
+    for sj in extracted_dir.rglob("summary.json"):
+        candidate = sj.parent
+        if all((candidate / f).exists() for f in REQUIRED_FILES):
+            return candidate
+    raise FileNotFoundError(
+        "Missing one or more required files (summary.json, epochs.csv, samples.csv, emissions.csv) in the uploaded ZIP."
+    )
+
+def extract_zip_to_tmp(uploaded_file) -> Path:
+    out_dir = Path("/tmp") / f"run_{Path(uploaded_file.name).stem}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    zbytes = io.BytesIO(uploaded_file.getvalue())
+    with zipfile.ZipFile(zbytes, "r") as zf:
+        zf.extractall(out_dir)
+    return _find_run_root(out_dir)
 
 def extract_zip_path_to_tmp(zip_path: Path) -> Path:
+    out_dir = Path("/tmp") / f"run_{zip_path.stem}"
+    out_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(str(zip_path), "r") as zf:
-        out_dir = Path("/tmp") / f"run_{zip_path.stem}"
-        out_dir.mkdir(parents=True, exist_ok=True)
         zf.extractall(out_dir)
-        top = [p for p in out_dir.iterdir() if p.is_dir()]
-        if len(top) == 1 and (top[0] / "summary.json").exists():
-            return top[0]
-        return out_dir
+    return _find_run_root(out_dir)
+
+
 
 st.caption("Upload one or more *run ZIPs* OR let the app preload any demo ZIPs found under `sample_runs/` in this repo.")
 
