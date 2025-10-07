@@ -8,6 +8,23 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
+
+# --- quick debug of paths & zips (put near the top, after imports) ---
+from pathlib import Path
+import streamlit as st
+
+root = Path(__file__).resolve().parent
+sr1 = root / "sample_runs"
+sr2 = Path.cwd() / "sample_runs"
+found = [p for p in (sr1, sr2) if p.exists()]
+zips = []
+for d in found:
+    zips += list(d.glob("*.zip"))
+
+st.caption(f"🛠 repo dir: {root}")
+st.caption(f"🛠 sample_runs dirs found: {', '.join(map(str,found)) or 'none'}")
+st.caption(f"🛠 zips: {', '.join(p.name for p in zips) or 'none'}")
+
 APP_TITLE = "Carbon Footprint Calculator for AI Models — Daniel Ojeda Rosales"
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🌿", layout="wide")
