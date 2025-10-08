@@ -1,198 +1,492 @@
-# Carbon Footprint Calculator for AI Models — Daniel Ojeda Rosales
-
-import json, io, os, zipfile
+import io
+import json
+import os
+import re
+import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 import streamlit as st
 
+# =============================
+# App Constants & Theme
+# =============================
 APP_TITLE = "Carbon Footprint Calculator for AI Models — Daniel Ojeda Rosales"
+REQUIRED_FILES = {"summary.json", "epochs.csv", "samples.csv", "emissions.csv"}
+SAMPLE_RUNS_DIR = Path("sample_runs")
 
-st.set_page_config(page_title=APP_TITLE, page_icon="🌿", layout="wide")
+# Country display (emoji + color). Colors chosen for distinctness on light plots.
+COUNTRY_META = {
+    "KOR": {"name": "Korea", "flag": "🇰🇷", "color": "#1f77b4"},
+    "MEX": {"name": "Mexico", "flag": "🇲🇽", "color": "#ff7f0e"},
+    "CAN": {"name": "Canada", "flag": "🇨🇦", "color": "#2ca02c"},
+    "FRA": {"name": "France", "flag": "🇫🇷", "color": "#d62728"},
+    "MNG": {"name": "Mongolia", "flag": "🇲🇳", "color": "#9467bd"},
+}
 
-# Dark shell; figures will be white for readability
-st.markdown("""
-<style>
-.block-container { padding-top: 1.2rem; }
-.reportview-container, .main, .stApp { background: #0f1116 !important; color: #e2e2e2; }
-.card { background: #161a22; border: 1px solid #2a2f3a; padding: 1rem; border-radius: 14px; }
-hr { border: none; border-top: 1px solid #2a2f3a; margin: 0.5rem 0 1rem; }
-</style>
-""", unsafe_allow_html=True)
+# Default kgCO2e per kWh factors (approximate; editable in sidebar). These act as fallbacks
+# if CodeCarbon's internal mappings aren't available at runtime.
+DEFAULT_COUNTRY_FACTORS = {
+    "KOR": 0.45,
+    "MEX": 0.40,
+    "CAN": 0.12,
+    "FRA": 0.06,
+    "MNG": 0.80,
+}
 
-st.title(APP_TITLE)
-st.caption("Upload one or more *run ZIPs* (each containing summary.json, epochs.csv, samples.csv, emissions.csv).")
+# =============================
+# Utility Functions
+# =============================
 
-COUNTRY_COLOR = {"KOR":"#1f77b4","CAN":"#2ca02c","MEX":"#ff7f0e","MNG":"#9467bd"}
+def _safe_json_load(path: Path) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-def fig_white(size=(7.5,4)):
-    return plt.figure(figsize=size, facecolor="white")
 
-def extract_zip_to_tmp(uploaded_zip) -> Path:
-    zbytes = io.BytesIO(uploaded_zip.getvalue())
-    with zipfile.ZipFile(zbytes, "r") as zf:
-        out_dir = Path("/tmp") / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        zf.extractall(out_dir)
-        # If single top-level dir exists, use it
-        top = [p for p in out_dir.iterdir() if p.is_dir()]
-        if len(top) == 1 and (top[0] / "summary.json").exists():
-            return top[0]
-        return out_dir
+def _find_run_root(extracted_dir: Path) -> Optional[Path]:
+    """
+    Robustly find the run folder containing REQUIRED_FILES under extracted_dir.
+    Handles cases where the ZIP contains an extra parent folder or is nested.
+    """
+    # 1) Direct hit at this level
+    entries = {p.name for p in extracted_dir.iterdir() if p.is_file()}
+    if REQUIRED_FILES.issubset(entries):
+        return extracted_dir
 
-def load_run_dir(run_dir: Path):
-    summary_p = run_dir / "summary.json"
-    epochs_p  = run_dir / "epochs.csv"
-    samples_p = run_dir / "samples.csv"
-    emissions_p = run_dir / "emissions.csv"
-    for p in [summary_p, epochs_p, samples_p, emissions_p]:
-        if not p.exists(): raise FileNotFoundError(f"Missing {p.name} in {run_dir}")
-    with open(summary_p, "r") as f: summary = json.load(f)
-    epochs   = pd.read_csv(epochs_p)
-    samples  = pd.read_csv(samples_p)
-    emissions= pd.read_csv(emissions_p)
-    return summary, epochs, samples, emissions
+    # 2) Search one level down for a directory that contains required files
+    for child in extracted_dir.iterdir():
+        if child.is_dir():
+            entries = {p.name for p in child.iterdir() if p.is_file()}
+            if REQUIRED_FILES.issubset(entries):
+                return child
 
-uploads = st.file_uploader("Upload run ZIP(s)", type=["zip"], accept_multiple_files=True)
+    # 3) Recursive search just in case of deeper nesting
+    for root, dirs, files in os.walk(extracted_dir):
+        if REQUIRED_FILES.issubset(set(files)):
+            return Path(root)
 
-runs = []
-if uploads:
-    for up in uploads:
-        try:
-            rd = extract_zip_to_tmp(up)
-            summary, epochs, samples, emissions = load_run_dir(rd)
-            runs.append((rd.name, summary, epochs, samples))
-            st.success(f"Loaded: {rd}")
-        except Exception as e:
-            st.error(f"Failed to load {up.name}: {e}")
+    return None
 
-if not runs:
-    st.stop()
 
-# Tabs
-tab1, tab2, tab3, tab4 = st.tabs(["Baseline (single run)", "Online vs Offline (Korea)", "Region & PUE (what-if)", "Multi-run overlay"])
+def _parse_emissions_kwh(emissions_csv: Path) -> float:
+    """Try common columns to extract measured kWh from CodeCarbon logs."""
+    df = pd.read_csv(emissions_csv)
+    cols = [c for c in df.columns]
+    # Common names we have seen
+    candidates = [
+        "energy_consumed",  # kWh in many CodeCarbon versions
+        "energy_kwh",
+        "energy",  # sometimes in Wh; we will detect by magnitude
+    ]
+    for c in candidates:
+        if c in cols:
+            kwh = df[c].sum()
+            # Heuristic: if suspiciously large, it may be Wh — convert to kWh
+            if kwh > 1e4:  # 10,000 kWh is unrealistic for our demo scales
+                kwh = kwh / 1000.0
+            return float(kwh)
+    # Fallback: zero, but downstream UI will warn
+    return 0.0
 
-# -------- Baseline (uses first run) --------
-with tab1:
-    name, summary, epochs, samples = runs[0]
-    st.subheader(f"Baseline — {name}")
-    mode = summary.get("tracker_mode", "online").upper()
-    iso  = summary.get("country_iso_code") or "auto"
-    pue  = summary.get("pue", None)
-    suffix = f"{mode} — {'Korea' if (iso=='KOR' or mode=='ONLINE') else iso}" + (f", PUE={pue:.2f}" if pue else "")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Energy (kWh)", f"{summary.get('total_energy_kwh',0):.3f}")
-    c2.metric("Emissions (kg)", f"{summary.get('total_emissions_kg',0):.3f}")
-    dur = summary.get("duration_s") or 0
-    c3.metric("Duration (h)", f"{dur/3600.0:.2f}")
-    tc = summary.get("total_cost_usd")
-    c4.metric("Total cost (USD)", f"{tc:.2f}" if tc is not None else "–")
-    st.markdown("<hr/>", unsafe_allow_html=True)
 
-    fig = fig_white(); ax = fig.gca()
-    ax.bar(epochs["epoch"], epochs["emissions_kg"].fillna(0.0))
-    ax.set_xlabel("Epoch"); ax.set_ylabel("kg CO₂e")
-    ax.set_title(f"Emissions per epoch — {suffix}", loc="left")
-    st.pyplot(fig)
+def _read_epochs(epochs_csv: Path) -> pd.DataFrame:
+    df = pd.read_csv(epochs_csv)
+    # Try to infer columns commonly used: epoch, accuracy, loss, emissions, cumulative
+    # We'll create helpful derived columns if missing.
+    if "epoch" not in df.columns:
+        # Try zero-based as index if absent
+        df.insert(0, "epoch", np.arange(1, len(df) + 1))
+    if "emissions_kg" not in df.columns:
+        # allow kwh column and a factor for conversion; otherwise leave NaN
+        if "kwh" in df.columns:
+            df["emissions_kg"] = np.nan  # unknown factor at epoch granularity
+        else:
+            df["emissions_kg"] = np.nan
+    # cumulative helper if not present
+    if "cumulative_emissions_kg" not in df.columns:
+        if "emissions_kg" in df.columns and df["emissions_kg"].notna().any():
+            df["cumulative_emissions_kg"] = df["emissions_kg"].fillna(0).cumsum()
+        else:
+            df["cumulative_emissions_kg"] = np.nan
+    return df
 
-    fig = fig_white(); ax = fig.gca()
-    cum = epochs["emissions_kg"].fillna(0.0).cumsum()
-    ax.plot(epochs["epoch"], cum, marker="o")
-    ax.set_xlabel("Epoch"); ax.set_ylabel("Cumulative kg CO₂e")
-    ax.set_title(f"Cumulative emissions — {suffix}", loc="left")
-    st.pyplot(fig)
 
-    fig = fig_white(); ax = fig.gca()
-    t0 = samples["timestamp"].iloc[0]; tmin = (samples["timestamp"] - t0)/60.0
-    if samples["gpu_util_pct"].notna().any():
-        ax.plot(tmin, samples["gpu_util_pct"].fillna(0.0), label="GPU Util (%)")
-        ax.set_ylabel("GPU Utilization (%)")
+def _read_samples(samples_csv: Path) -> pd.DataFrame:
+    df = pd.read_csv(samples_csv)
+    # Expect columns like: timestamp, cpu_percent, gpu_util, mem_gb, gpu_mem_gb
+    # We'll standardize if we can.
+    rename_map = {}
+    for cand in ["cpu", "cpu_percent", "cpu_util", "cpu_usage"]:
+        if cand in df.columns:
+            rename_map[cand] = "cpu_percent"
+            break
+    for cand in ["gpu", "gpu_util", "gpu_percent", "gpu_usage"]:
+        if cand in df.columns:
+            rename_map[cand] = "gpu_util"
+            break
+    for cand in ["mem_gb", "memory_gb", "ram_gb"]:
+        if cand in df.columns:
+            rename_map[cand] = "mem_gb"
+            break
+    for cand in ["gpu_mem_gb", "vram_gb"]:
+        if cand in df.columns:
+            rename_map[cand] = "gpu_mem_gb"
+            break
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    return df
+
+
+def read_run_folder(run_root: Path) -> Dict[str, object]:
+    summary = _safe_json_load(run_root / "summary.json")
+    epochs = _read_epochs(run_root / "epochs.csv")
+    samples = _read_samples(run_root / "samples.csv")
+    emissions_kwh = _parse_emissions_kwh(run_root / "emissions.csv")
+    return {
+        "root": run_root,
+        "summary": summary,
+        "epochs": epochs,
+        "samples": samples,
+        "measured_kwh": emissions_kwh,
+    }
+
+
+def extract_zip_to_tmp(file_like: io.BytesIO, label: str) -> Optional[Path]:
+    import zipfile
+
+    tmpdir = Path(tempfile.mkdtemp(prefix=f"runzip_{label}_"))
+    try:
+        with zipfile.ZipFile(file_like) as zf:
+            zf.extractall(tmpdir)
+        run_root = _find_run_root(tmpdir)
+        if run_root is None:
+            st.error(f"Could not locate a run folder with required files in '{label}'.")
+            return None
+        return run_root
+    except zipfile.BadZipFile:
+        st.error(f"The file '{label}' is not a valid ZIP.")
+        return None
+
+
+def list_repo_zip_paths() -> List[Path]:
+    if not SAMPLE_RUNS_DIR.exists():
+        return []
+    return sorted(SAMPLE_RUNS_DIR.glob("*.zip"))
+
+
+# =============================
+# Plot Helpers (Plotly, white background)
+# =============================
+
+def _apply_plot_defaults(fig: go.Figure, height: int = 380) -> go.Figure:
+    fig.update_layout(
+        template="plotly_white",
+        height=height,
+        margin=dict(l=40, r=20, t=40, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="rgba(0,0,0,0.05)")
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="rgba(0,0,0,0.05)")
+    return fig
+
+
+def plot_epoch_emissions(df: pd.DataFrame) -> go.Figure:
+    y = df["emissions_kg"] if "emissions_kg" in df.columns else None
+    if y is None or y.isna().all():
+        # If epoch-level emissions aren't available, show a placeholder
+        fig = go.Figure()
+        fig.add_annotation(text="Per-epoch emissions not found in epochs.csv",
+                           xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+        return _apply_plot_defaults(fig)
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=df["epoch"], y=y, name="Emissions per epoch (kgCO₂e)"))
+    fig.update_yaxes(title_text="kgCO₂e")
+    fig.update_xaxes(title_text="Epoch")
+    return _apply_plot_defaults(fig)
+
+
+def plot_cumulative_emissions(df: pd.DataFrame) -> go.Figure:
+    y = df["cumulative_emissions_kg"] if "cumulative_emissions_kg" in df.columns else None
+    if y is None or y.isna().all():
+        fig = go.Figure()
+        fig.add_annotation(text="Cumulative emissions not found; provide emissions_kg in epochs.csv",
+                           xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+        return _apply_plot_defaults(fig)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df["epoch"], y=y, mode="lines+markers",
+                             name="Cumulative emissions (kgCO₂e)"))
+    fig.update_yaxes(title_text="kgCO₂e")
+    fig.update_xaxes(title_text="Epoch")
+    return _apply_plot_defaults(fig)
+
+
+def plot_utilization(samples: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if "cpu_percent" in samples.columns:
+        fig.add_trace(go.Scatter(x=np.arange(len(samples)), y=samples["cpu_percent"],
+                                 mode="lines", name="CPU %"))
+    if "gpu_util" in samples.columns:
+        fig.add_trace(go.Scatter(x=np.arange(len(samples)), y=samples["gpu_util"],
+                                 mode="lines", name="GPU %"))
+    fig.update_yaxes(title_text="Utilization (%)", range=[0, 100])
+    fig.update_xaxes(title_text="Sample index (1s)")
+    return _apply_plot_defaults(fig)
+
+
+def plot_accuracy_vs_emissions(df: pd.DataFrame) -> go.Figure:
+    # Look for common accuracy/metric columns
+    acc_col = None
+    for cand in ["accuracy", "acc", "val_accuracy", "top1_acc"]:
+        if cand in df.columns:
+            acc_col = cand
+            break
+    emis_col = None
+    for cand in ["cumulative_emissions_kg", "emissions_kg"]:
+        if cand in df.columns and df[cand].notna().any():
+            emis_col = cand
+            break
+    fig = go.Figure()
+    if acc_col and emis_col:
+        fig.add_trace(go.Scatter(x=df[emis_col], y=df[acc_col], mode="markers+lines",
+                                 name=f"{acc_col} vs {emis_col}"))
+        fig.update_xaxes(title_text="Emissions (kgCO₂e)")
+        fig.update_yaxes(title_text=acc_col)
     else:
-        ax.plot(tmin, samples["cpu_util_pct"].fillna(0.0), label="CPU Util (%)")
-        ax.set_ylabel("CPU Utilization (%)")
-    ax.set_xlabel("Minutes"); ax.legend()
-    ax.set_title(f"Utilization over time — {suffix}", loc="left")
-    st.pyplot(fig)
+        fig.add_annotation(text="Couldn't find accuracy/emissions columns in epochs.csv",
+                           xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+    return _apply_plot_defaults(fig)
 
-# -------- Online vs Offline (Korea) --------
-with tab2:
-    st.subheader("Verification: ONLINE (Korea via VPN) vs OFFLINE-KOR")
-    # find one offline-KOR and one online among uploaded runs
-    offline = [(n,s,e) for (n,s,e,_) in runs if s.get("tracker_mode")=="offline" and s.get("country_iso_code")=="KOR"]
-    online  = [(n,s,e) for (n,s,e,_) in runs if s.get("tracker_mode")=="online"]
-    if not offline or not online:
-        st.info("Upload at least one OFFLINE-KOR run and one ONLINE run to enable this view.")
-    else:
-        n_off, s_off, e_off = offline[0]
-        n_on,  s_on,  e_on  = online[0]
-        max_ep = min(e_off["epoch"].max(), e_on["epoch"].max())
-        off = e_off[e_off["epoch"]<=max_ep]; on = e_on[e_on["epoch"]<=max_ep]
 
-        fig = fig_white(); ax = fig.gca()
-        ax.plot(off["epoch"], off["emissions_kg"].fillna(0.0), marker="o", label=f"OFFLINE KOR (PUE={s_off.get('pue')})")
-        ax.plot(on["epoch"],  on["emissions_kg"].fillna(0.0),  marker="o", label=f"ONLINE auto (PUE={s_on.get('pue')})")
-        ax.set_xlabel("Epoch"); ax.set_ylabel("kg CO₂e per epoch")
-        ax.set_title("Per-epoch emissions — ONLINE vs OFFLINE-KOR", loc="left")
-        ax.legend(); st.pyplot(fig)
+def plot_country_bars(measured_kwh: float, factors: Dict[str, float], pue: float) -> go.Figure:
+    fig = go.Figure()
+    for iso, meta in COUNTRY_META.items():
+        name = f"{meta['flag']} {meta['name']}"
+        color = meta["color"]
+        kg = measured_kwh * pue * factors.get(iso, DEFAULT_COUNTRY_FACTORS.get(iso, 0.4))
+        fig.add_trace(go.Bar(x=[name], y=[kg], name=name, marker_color=color))
+    fig.update_yaxes(title_text="kgCO₂e")
+    fig.update_xaxes(title_text="Country (what‑if)")
+    return _apply_plot_defaults(fig, height=420)
 
-        fig = fig_white(); ax = fig.gca()
-        ax.plot(off["epoch"], off["emissions_kg"].fillna(0.0).cumsum(), marker="o", label="OFFLINE KOR (cumulative)")
-        ax.plot(on["epoch"],  on["emissions_kg"].fillna(0.0).cumsum(),  marker="o", label="ONLINE auto (cumulative)")
-        ax.set_xlabel("Epoch"); ax.set_ylabel("Cumulative kg CO₂e")
-        ax.set_title("Cumulative emissions — ONLINE vs OFFLINE-KOR", loc="left")
-        ax.legend(); st.pyplot(fig)
 
-# -------- Region & PUE (what-if) --------
-with tab3:
-    st.subheader("Region & PUE sensitivity (fixed measured IT kWh)")
-    name, summary, epochs, samples = runs[0]
-    measured_kwh = summary.get("total_energy_kwh")
-    if measured_kwh is None:
-        st.warning("Selected run missing total_energy_kwh in summary.json")
-    else:
-        baseline_pue = float(summary.get("pue", 1.2))
-        regions = st.multiselect("Regions", ["KOR","CAN","MEX","MNG"], default=["KOR","CAN","MEX","MNG"])
-        pue_vals = st.multiselect("PUE values", [round(baseline_pue,2),1.2,1.6], default=[round(baseline_pue,2),1.2,1.6])
-        EMISSION_FACTORS = {"KOR":0.45,"CAN":0.12,"MEX":0.43,"MNG":0.75}
-        REGION_NAME = {"KOR":"South Korea","CAN":"Canada","MEX":"Mexico","MNG":"Mongolia"}
+def plot_multi_run_overlay(runs: Dict[str, Dict[str, object]]) -> go.Figure:
+    fig = go.Figure()
+    for label, data in runs.items():
+        df = data["epochs"]
+        if "cumulative_emissions_kg" in df.columns and df["cumulative_emissions_kg"].notna().any():
+            fig.add_trace(go.Scatter(x=df["epoch"], y=df["cumulative_emissions_kg"],
+                                     mode="lines+markers", name=label))
+        else:
+            continue
+    fig.update_xaxes(title_text="Epoch")
+    fig.update_yaxes(title_text="Cumulative kgCO₂e")
+    return _apply_plot_defaults(fig)
 
-        rows = []
-        for r in regions:
-            ef = float(EMISSION_FACTORS[r])
-            for p in pue_vals:
-                rows.append({"iso":r, "region":REGION_NAME[r], "pue":float(p), "emissions_kg": measured_kwh*float(p)*ef})
-        df = pd.DataFrame(rows).sort_values(["iso","pue"]).reset_index(drop=True)
-        st.dataframe(df, use_container_width=True)
 
-        fig = fig_white(); ax = fig.gca()
-        labels = [f"{row['region']} | PUE={row['pue']}" for _, row in df.iterrows()]
-        colors = [COUNTRY_COLOR[row['iso']] for _, row in df.iterrows()]
-        ax.bar(labels, df["emissions_kg"], color=colors)
-        ax.set_xticklabels(labels, rotation=45, ha="right")
-        ax.set_ylabel("Emissions (kg CO₂e)")
-        ax.set_title("Region & PUE sensitivity", loc="left")
-        fig.tight_layout(); st.pyplot(fig)
+# =============================
+# Sidebar Controls & Explanations
+# =============================
 
-# -------- Multi-run overlay (general) --------
-with tab4:
-    st.subheader("Multi-run overlay")
-    if len(runs) < 2:
-        st.info("Upload at least two runs to compare.")
-    else:
-        fig = fig_white((8.5,4.5)); ax = fig.gca()
-        for name, summary, epochs, _ in runs:
-            label = f"{name} | {summary.get('tracker_mode','?').upper()} | {summary.get('country_iso_code') or 'auto'} | PUE={summary.get('pue')}"
-            ax.plot(epochs["epoch"], epochs["emissions_kg"].fillna(0.0), marker="o", label=label)
-        ax.set_xlabel("Epoch"); ax.set_ylabel("kg CO₂e per epoch")
-        ax.set_title("Per-epoch emissions — multiple runs", loc="left")
-        ax.legend(fontsize=8); fig.tight_layout(); st.pyplot(fig)
+def sidebar_explanations():
+    st.sidebar.header("ℹ️ How to read the plots")
+    st.sidebar.markdown(
+        """
+        **Baseline**
+        - *Emissions per epoch*: bars show per‑epoch kgCO₂e (if available).
+        - *Cumulative emissions*: line grows as training progresses.
+        - *Utilization over time*: CPU/GPU percentages sampled each second.
+        - *Accuracy vs emissions*: how performance improves as emissions accumulate.
 
-        fig = fig_white((8.5,4.5)); ax = fig.gca()
-        for name, summary, epochs, _ in runs:
-            label = f"{name} | {summary.get('tracker_mode','?').upper()} | {summary.get('country_iso_code') or 'auto'} | PUE={summary.get('pue')}"
-            ax.plot(epochs["epoch"], epochs["emissions_kg"].fillna(0.0).cumsum(), marker="o", label=label)
-        ax.set_xlabel("Epoch"); ax.set_ylabel("Cumulative kg CO₂e")
-        ax.set_title("Cumulative emissions — multiple runs", loc="left")
-        ax.legend(fontsize=8); fig.tight_layout(); st.pyplot(fig)
+        **Region & PUE**
+        - Uses your **measured kWh** from a single run.
+        - Applies **PUE** (data center overhead) and **country factors** (kgCO₂e/kWh).
+        - Bars compare what emissions *would have been* in each country.
+
+        **Online vs Offline (Korea)**
+        - Select one **online** run and one **offline‑KOR** run.
+        - Overlays cumulative emissions to compare geolocation vs fixed‑factor settings.
+
+        **Multi‑run overlay**
+        - Compare cumulative emissions curves across any number of runs.
+        """
+    )
+
+    st.sidebar.header("⚙️ Factors (editable)")
+    st.sidebar.caption(
+        "Country factors are default kgCO₂e per kWh. Adjust if you have newer data."
+    )
+    factors = {}
+    for iso, default in DEFAULT_COUNTRY_FACTORS.items():
+        meta = COUNTRY_META[iso]
+        factors[iso] = st.sidebar.number_input(
+            f"{meta['flag']} {meta['name']} (kgCO₂e/kWh)",
+            min_value=0.0, max_value=2.0, value=float(default), step=0.01,
+        )
+
+    pue = st.sidebar.number_input(
+        "PUE (Power Usage Effectiveness)", min_value=1.0, max_value=3.0, value=1.2, step=0.05
+    )
+    return factors, pue
+
+
+# =============================
+# Streamlit App
+# =============================
+
+def main():
+    st.set_page_config(page_title=APP_TITLE, page_icon="🧮", layout="wide")
+
+    st.title(APP_TITLE)
+    st.caption("Streamlit dark shell · charts on white for visibility · flags + distinct colors")
+
+    # Sidebar: explanations + editable factors
+    factors, pue = sidebar_explanations()
+
+    # Preload Toggle
+    st.subheader("Data Sources")
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        do_preload = st.checkbox("Preload bundled demo runs (sample_runs/)", value=False)
+    preloaded_runs: Dict[str, Dict[str, object]] = {}
+
+    if do_preload:
+        zips = list_repo_zip_paths()
+        if not zips:
+            st.warning("No ZIPs found in ./sample_runs — check your deployment branch & files.")
+        for z in zips:
+            try:
+                with open(z, "rb") as f:
+                    data = io.BytesIO(f.read())
+                run_root = extract_zip_to_tmp(data, label=z.name)
+                if run_root is None:
+                    continue
+                run_data = read_run_folder(run_root)
+                label = f"sample_runs/{z.name}"
+                preloaded_runs[label] = run_data
+                st.success(f"Preloaded: {label}")
+            except Exception as e:
+                st.error(f"Error preloading {z.name}: {e}")
+
+    # Uploads
+    uploaded_runs: Dict[str, Dict[str, object]] = {}
+    with c2:
+        up = st.file_uploader(
+            "Upload one or more run ZIPs (each contains summary.json, epochs.csv, samples.csv, emissions.csv)",
+            type=["zip"], accept_multiple_files=True,
+        )
+        if up:
+            for f in up:
+                run_root = extract_zip_to_tmp(f.getvalue() if hasattr(f, "getvalue") else f.read(), label=f.name)
+                if run_root is None:
+                    continue
+                try:
+                    run_data = read_run_folder(run_root)
+                    uploaded_runs[f"upload/{f.name}"] = run_data
+                    st.success(f"Loaded: upload/{f.name}")
+                except Exception as e:
+                    st.error(f"Failed to read {f.name}: {e}")
+
+    # Merge all available runs
+    all_runs = {**preloaded_runs, **uploaded_runs}
+    if not all_runs:
+        st.info("No runs loaded yet. Preload from sample_runs/ or upload ZIPs to begin.")
+        st.stop()
+
+    # Tabs
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Baseline",
+        "Region & PUE (what‑if)",
+        "Online vs Offline (Korea)",
+        "Multi‑run overlay",
+    ])
+
+    # =============================
+    # Baseline Tab
+    # =============================
+    with tab1:
+        st.markdown("### Baseline: explore a single run")
+        labels = list(all_runs.keys())
+        sel = st.selectbox("Select a run", labels)
+        data = all_runs[sel]
+        summary = data["summary"]
+        measured_kwh = data["measured_kwh"]
+        epochs = data["epochs"]
+        samples = data["samples"]
+
+        cA, cB, cC = st.columns(3)
+        with cA:
+            st.metric("Measured energy (kWh)", f"{measured_kwh:.4f}")
+        with cB:
+            mode = summary.get("mode", summary.get("carbon_mode", "n/a")).upper() if isinstance(summary, dict) else "n/a"
+            st.metric("Mode", mode)
+        with cC:
+            region = summary.get("region", summary.get("country", "n/a")) if isinstance(summary, dict) else "n/a"
+            st.metric("Region", str(region))
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.plotly_chart(plot_epoch_emissions(epochs), use_container_width=True)
+        with c2:
+            st.plotly_chart(plot_cumulative_emissions(epochs), use_container_width=True)
+
+        st.plotly_chart(plot_utilization(samples), use_container_width=True)
+        st.plotly_chart(plot_accuracy_vs_emissions(epochs), use_container_width=True)
+
+    # =============================
+    # Region & PUE What‑If Tab
+    # =============================
+    with tab2:
+        st.markdown("### Region & PUE what‑if: reuse measured kWh, vary location/PUE")
+        labels = list(all_runs.keys())
+        sel = st.selectbox("Select a base run (for measured kWh)", labels, key="whatif_select")
+        measured_kwh = all_runs[sel]["measured_kwh"]
+        if measured_kwh <= 0:
+            st.error("Measured kWh couldn't be derived from emissions.csv. Check the file or columns.")
+        st.plotly_chart(plot_country_bars(measured_kwh, factors, pue), use_container_width=True)
+        st.caption("Bars show kgCO₂e = measured_kWh × PUE × country_factor. Flags and colors distinguish countries.")
+
+    # =============================
+    # Online vs Offline (Korea) Tab
+    # =============================
+    with tab3:
+        st.markdown("### Online vs Offline (Korea): overlay cumulative emissions")
+        labels = list(all_runs.keys())
+        c1, c2 = st.columns(2)
+        with c1:
+            run_online = st.selectbox("Select ONLINE run", labels, key="ovoo_online")
+        with c2:
+            run_offkor = st.selectbox("Select OFFLINE‑KOR run", labels, key="ovoo_offkor")
+
+        comparison = {}
+        if run_online:
+            comparison[f"Online — {run_online}"] = all_runs[run_online]
+        if run_offkor and run_offkor != run_online:
+            comparison[f"Offline‑KOR — {run_offkor}"] = all_runs[run_offkor]
+        if len(comparison) < 2:
+            st.info("Pick two different runs (one ONLINE, one OFFLINE‑KOR) to see the overlay.")
+        st.plotly_chart(plot_multi_run_overlay(comparison), use_container_width=True)
+
+    # =============================
+    # Multi‑run Overlay Tab
+    # =============================
+    with tab4:
+        st.markdown("### Multi‑run overlay: compare cumulative curves across runs")
+        labels = list(all_runs.keys())
+        selected = st.multiselect("Select runs to compare", labels, default=labels[: min(3, len(labels))])
+        subset = {k: all_runs[k] for k in selected}
+        if not subset:
+            st.info("Select at least one run.")
+        st.plotly_chart(plot_multi_run_overlay(subset), use_container_width=True)
+
+
+if __name__ == "__main__":
+    main()
+
