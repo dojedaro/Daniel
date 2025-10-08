@@ -79,8 +79,7 @@ def _find_run_root(extracted_dir: Path) -> Optional[Path]:
 def _parse_emissions_kwh(emissions_csv: Path) -> float:
     """Try common columns to extract measured kWh from CodeCarbon logs."""
     df = pd.read_csv(emissions_csv)
-    cols = [c for c in df.columns]
-    # Common names we have seen
+    cols = list(df.columns)
     candidates = [
         "energy_consumed",  # kWh in many CodeCarbon versions
         "energy_kwh",
@@ -90,32 +89,28 @@ def _parse_emissions_kwh(emissions_csv: Path) -> float:
         if c in cols:
             kwh = df[c].sum()
             # Heuristic: if suspiciously large, it may be Wh — convert to kWh
-            if kwh > 1e4:  # 10,000 kWh is unrealistic for our demo scales
+            if kwh > 1e4:
                 kwh = kwh / 1000.0
             return float(kwh)
-    # Fallback: zero, but downstream UI will warn
     return 0.0
 
 
 def _read_epochs(epochs_csv: Path) -> pd.DataFrame:
     df = pd.read_csv(epochs_csv)
-    # Try to infer columns commonly used: epoch, accuracy, loss, emissions, cumulative
-    # We'll create helpful derived columns if missing.
+    # Ensure epoch column
     if "epoch" not in df.columns:
-        # Try zero-based as index if absent
         df.insert(0, "epoch", np.arange(1, len(df) + 1))
+    # Normalize potential per-epoch kWh column names
+    if "kwh" not in df.columns:
+        for cand in ["energy_kwh", "epoch_kwh", "energy", "energy_consumed_kwh"]:
+            if cand in df.columns:
+                df = df.rename(columns={cand: "kwh"})
+                break
+    # Create placeholders to be possibly filled later
     if "emissions_kg" not in df.columns:
-        # allow kwh column and a factor for conversion; otherwise leave NaN
-        if "kwh" in df.columns:
-            df["emissions_kg"] = np.nan  # unknown factor at epoch granularity
-        else:
-            df["emissions_kg"] = np.nan
-    # cumulative helper if not present
+        df["emissions_kg"] = np.nan
     if "cumulative_emissions_kg" not in df.columns:
-        if "emissions_kg" in df.columns and df["emissions_kg"].notna().any():
-            df["cumulative_emissions_kg"] = df["emissions_kg"].fillna(0).cumsum()
-        else:
-            df["cumulative_emissions_kg"] = np.nan
+        df["cumulative_emissions_kg"] = np.nan
     return df
 
 
@@ -149,13 +144,45 @@ def read_run_folder(run_root: Path) -> Dict[str, object]:
     summary = _safe_json_load(run_root / "summary.json")
     epochs = _read_epochs(run_root / "epochs.csv")
     samples = _read_samples(run_root / "samples.csv")
+
     emissions_kwh = _parse_emissions_kwh(run_root / "emissions.csv")
+
+    # Try to derive total kgCO2e from emissions.csv if present
+    kg_total = None
+    try:
+        df_e = pd.read_csv(run_root / "emissions.csv")
+        for c in ["emissions", "emissions_kg", "co2e", "carbon_emissions"]:
+            if c in df_e.columns:
+                kg_total = float(df_e[c].sum())
+                break
+    except Exception:
+        kg_total = None
+
+    # If we have per-epoch kWh and a total kg, derive kg/kWh factor and fill per-epoch emissions
+    kg_per_kwh = None
+    if emissions_kwh and kg_total and emissions_kwh > 0:
+        kg_per_kwh = kg_total / emissions_kwh
+
+    # Fill emissions_kg and cumulative if missing
+    if epochs["emissions_kg"].isna().all():
+        if "kwh" in epochs.columns and epochs["kwh"].notna().any() and kg_per_kwh:
+            epochs["emissions_kg"] = epochs["kwh"].fillna(0) * kg_per_kwh
+        elif kg_total is not None and len(epochs) > 0:
+            # Even split fallback when we only know totals
+            per_epoch = kg_total / len(epochs)
+            epochs["emissions_kg"] = per_epoch
+
+    if epochs["cumulative_emissions_kg"].isna().all() and epochs["emissions_kg"].notna().any():
+        epochs["cumulative_emissions_kg"] = epochs["emissions_kg"].fillna(0).cumsum()
+
     return {
         "root": run_root,
         "summary": summary,
         "epochs": epochs,
         "samples": samples,
         "measured_kwh": emissions_kwh,
+        "measured_kg": kg_total,
+        "kg_per_kwh": kg_per_kwh,
     }
 
 
@@ -280,12 +307,14 @@ def plot_country_bars(measured_kwh: float, factors: Dict[str, float], pue: float
 def plot_multi_run_overlay(runs: Dict[str, Dict[str, object]]) -> go.Figure:
     fig = go.Figure()
     for label, data in runs.items():
-        df = data["epochs"]
+        df = data["epochs"].copy()
         if "cumulative_emissions_kg" in df.columns and df["cumulative_emissions_kg"].notna().any():
             fig.add_trace(go.Scatter(x=df["epoch"], y=df["cumulative_emissions_kg"],
                                      mode="lines+markers", name=label))
         else:
-            continue
+            # Graceful message per missing series
+            fig.add_annotation(text=f"No cumulative emissions for {label}",
+                               xref="paper", yref="paper", x=0.5, y=0.95, showarrow=False)
     fig.update_xaxes(title_text="Epoch")
     fig.update_yaxes(title_text="Cumulative kgCO₂e")
     return _apply_plot_defaults(fig)
