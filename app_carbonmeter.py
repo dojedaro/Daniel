@@ -224,14 +224,10 @@ def plot_pue_sensitivity(df: pd.DataFrame, title: str):
     for idx, pue in enumerate(pue_values):
         df_sub = df[df["pue"] == pue]
         heights = []
-        color_list = []
         for c in countries:
             row = df_sub[df_sub["country"] == c].iloc[0]
             heights.append(row["emissions_kg"])
-            color_list.append(REGION_COLORS.get(row["country_iso"], "#ffffff"))
 
-        # Slightly mix country colors with index to distinguish bars
-        # but keep them bright and visible
         bar_positions = x + (idx - (len(pue_values) - 1) / 2) * width
         ax.bar(bar_positions, heights, width=width, label=f"PUE={pue}", alpha=0.8)
 
@@ -260,7 +256,6 @@ def plot_epochs_emissions_and_accuracy(epochs_df: pd.DataFrame, total_emissions_
       - Cumulative emissions
       - Accuracy vs epoch (if val_acc exists)
     """
-    # Ensure required columns exist
     if "epoch" not in epochs_df.columns:
         st.info("epochs.csv does not have 'epoch' column; skipping epoch plots.")
         return
@@ -268,7 +263,6 @@ def plot_epochs_emissions_and_accuracy(epochs_df: pd.DataFrame, total_emissions_
     emissions_col = "emissions_kg" if "emissions_kg" in epochs_df.columns else None
     val_acc_col = "val_acc" if "val_acc" in epochs_df.columns else None
 
-    # Convert epoch to int for safety
     epochs_df = epochs_df.copy()
     epochs_df["epoch"] = epochs_df["epoch"].astype(int)
 
@@ -401,11 +395,22 @@ baseline_option = st.sidebar.radio(
         "Use original measurement from summary.json",
         "Override baseline region/PUE",
     ],
+    help=(
+        "The baseline is the reference footprint used for interpretation and for the "
+        "efficiency metric (kg CO₂e per 1% accuracy). "
+        "If you override it, the app recomputes a hypothetical baseline emissions value "
+        "using your chosen region and PUE."
+    ),
 )
 
 baseline_region = st.sidebar.selectbox(
     "If overriding, assume this run happened in:",
     options=["Online (auto)", "Canada (CAN)", "Mexico (MEX)", "South Korea (KOR)", "Mongolia (MNG)"],
+    help=(
+        "This does NOT change your measured energy (kWh). It only changes how that energy is "
+        "translated into emissions for the baseline scenario, by assuming a different location "
+        "and grid factor."
+    ),
 )
 
 baseline_pue = st.sidebar.slider(
@@ -414,13 +419,18 @@ baseline_pue = st.sidebar.slider(
     max_value=2.0,
     value=1.2,
     step=0.05,
+    help=(
+        "PUE represents how efficient the data center is. "
+        "A PUE of 1.2 means that for every 1 kWh used by your hardware, "
+        "0.2 kWh are spent on cooling/overhead."
+    ),
 )
 
 pue_sensitivity_values = st.sidebar.multiselect(
     "Additional PUE scenarios for sensitivity plots",
     options=[1.2, 1.4, 1.6],
     default=[1.2, 1.6],
-    help="These will be used to compare how emissions change at different PUEs.",
+    help="These will be used to compare how emissions change at different PUE values.",
 )
 
 st.sidebar.markdown("---")
@@ -433,18 +443,82 @@ show_util_plots = st.sidebar.checkbox("Show utilization plot (if samples.csv ava
 # -----------------------------------------------------------
 
 st.title("Smart Carbon Footprint Calculator")
+
 st.markdown(
-    "This app analyzes **completed AI training runs** and estimates their carbon footprint.\n\n"
-    "Upload a `.zip` containing your run logs (including `summary.json`), and the calculator will:\n"
-    "- Show your **baseline footprint** (energy & emissions)\n"
-    "- Simulate the emissions if the **same energy** were consumed in:\n"
-    "  - Canada, Mexico, South Korea, and Mongolia\n"
-    "- Optionally relate **model accuracy** to emissions if epoch data is available.\n"
+    """
+This app analyzes **completed AI training runs** and estimates their carbon footprint,
+then shows how that footprint would change in different regions and data-center conditions.
+
+### How to make the most of this platform
+
+1. **Generate a run bundle** from your own training code using a logger that writes:
+   - `summary.json` (required),
+   - optionally `epochs.csv` and `samples.csv`.
+2. **Upload the bundle** here to see:
+   - your baseline energy and emissions,
+   - how emissions change if the same run happened in **Canada, Mexico, South Korea, or Mongolia**,
+   - optional links between **accuracy** and **emissions**.
+3. Use the **baseline override controls** in the sidebar to explore:
+   - how different locations and PUE assumptions change the footprint,
+   - how sensitive your conclusions are to infrastructure choices.
+"""
 )
 
 st.markdown("### 1. Upload your Run Bundle")
 
 uploaded_file = st.file_uploader("Upload a ZIP file containing one run folder", type=["zip"])
+
+# Detailed bundle format explanation
+with st.expander("What should my run bundle contain? (Click for details)"):
+    st.markdown("""
+**Required file – `summary.json`**
+
+This JSON file summarizes one completed training run. It must include:
+
+- `project_name` *(string)* – name of your project (e.g., `"carbon_calculator_mvp"`).
+- `run_name` *(string)* – identifier for this run (e.g., `"mnist_demo_kor"`).
+- `tracker_mode` *(string)* – `"online"` or `"offline"`, depending on how CodeCarbon was used.
+- `country_iso_code` *(string or null)* – ISO code if `tracker_mode` is `"offline"` (e.g., `"KOR"`), else `null`.
+- `pue` *(number)* – Power Usage Effectiveness assumed for the data center (e.g., `1.20`).
+- `duration_s` *(number)* – total run time in seconds.
+- `total_energy_kwh` *(number)* – total electrical energy consumed by the run, in kWh.
+- `total_emissions_kg` *(number)* – total CO₂-equivalent emissions (kg CO₂e).
+
+Optional but recommended:
+
+- `epochs` *(int)* – number of epochs in this run.
+- `tags` *(object)* – free metadata (e.g., dataset name, model name, framework).
+""")
+
+    st.markdown("""
+**Optional file – `epochs.csv`**
+
+Per-epoch metrics. Recommended columns:
+
+- `epoch` – epoch index (integer).
+- `duration_s` – duration of this epoch in seconds.
+- `train_loss`, `train_acc` – training loss/accuracy.
+- `val_loss`, `val_acc` – validation loss/accuracy.
+- `energy_kwh` – energy attributed to this epoch (optional).
+- `emissions_kg` – emissions attributed to this epoch (optional).
+
+This file enables accuracy-related plots and the “kg CO₂e per 1% accuracy” metric.
+""")
+
+    st.markdown("""
+**Optional file – `samples.csv`**
+
+Time-series samples of hardware usage. Typical columns:
+
+- `timestamp` – UNIX time (seconds).
+- `cpu_util_pct` – CPU utilization percentage.
+- `cpu_mem_gb_used`, `cpu_mem_gb_total` – CPU memory usage and total (GB).
+- `gpu_util_pct` – GPU utilization percentage (if GPU used).
+- `gpu_mem_gb_used`, `gpu_mem_gb_total` – GPU memory usage and total (GB).
+- `gpu_name`, `gpu_total_devices` – GPU name and count.
+
+This file enables the hardware utilization plot.
+""")
 
 if not uploaded_file:
     st.info(
@@ -498,6 +572,15 @@ with st.expander("Files detected in this bundle", expanded=False):
     st.write(f"- `epochs.csv`: {'✅' if epochs_df is not None else '❌'}")
     st.write(f"- `samples.csv`: {'✅' if samples_df is not None else '❌'}")
 
+st.markdown("""
+**How to interpret this section**
+
+- This tells you *what run you are looking at* (project, run name) and under which conditions it was originally measured.
+- If the tracker mode is **online**, the emissions used the location and cloud provider detected by CodeCarbon.
+- If the tracker mode is **offline**, emissions were computed assuming the specified `country_iso_code` and PUE.
+- The rest of the app will treat the **measured energy (kWh)** as fixed, and explore how emissions change under different regional assumptions.
+""")
+
 # -----------------------------------------------------------
 # Baseline footprint
 # -----------------------------------------------------------
@@ -511,7 +594,6 @@ if total_energy_kwh is None:
     st.error("summary.json is missing 'total_energy_kwh'; cannot compute footprints.")
     st.stop()
 
-# Decide baseline emissions
 baseline_info_lines = []
 
 if baseline_option == "Use original measurement from summary.json":
@@ -531,7 +613,7 @@ else:
         iso_override = "MNG"
 
     if iso_override is None:
-        # Online (auto) override: just use energy with some average global factor (rough approximation)
+        # Online (auto) override: use average of our four demo factors
         avg_factor = np.mean(list(EMISSION_FACTORS.values()))
         baseline_emissions_kg = total_energy_kwh * baseline_pue * avg_factor
         baseline_info_lines.append(
@@ -562,6 +644,20 @@ with col_b3:
 for line in baseline_info_lines:
     st.markdown(f"- {line}")
 
+st.markdown("""
+**How to read this section**
+
+- **Total energy used** is the fixed physical energy that your training run consumed.
+- **Baseline emissions** convert that energy into CO₂e using an emission factor and PUE.
+- If you **do not override** the baseline, the app uses the emissions directly from `summary.json`.
+- If you **override** the baseline, the app keeps energy the same but recomputes emissions as if the run had been executed in a different region and/or PUE.
+
+You can use this to:
+
+- Compare your original footprint with a **what-if scenario** (e.g., *what if I ran this in Canada with a PUE of 1.2?*).
+- Understand how sensitive your footprint is to **infrastructure choices**, not just your model.
+""")
+
 # -----------------------------------------------------------
 # Regional scenarios
 # -----------------------------------------------------------
@@ -577,6 +673,18 @@ pue_scenarios = sorted(pue_scenarios)
 
 df_regions = compute_region_scenarios(total_energy_kwh, baseline_pue_effective, pue_scenarios=pue_scenarios)
 
+st.markdown("""
+This table assumes your **measured energy (kWh)** is fixed, and asks:
+
+> *“What would the emissions be if this exact same energy demand were supplied in different countries and at different PUE values?”*
+
+- `grid_factor_kg_per_kwh` is the assumed average carbon intensity of the electricity grid.
+- `pue` is the data center efficiency.
+- `emissions_kg` is the resulting CO₂e footprint for that scenario.
+
+Changing the **baseline PUE** in the sidebar changes the PUE used here for the baseline scenario, and therefore scales emissions up or down.
+""")
+
 st.write("**Scenario table:** Same energy, different grids and PUE values.")
 st.dataframe(df_regions, use_container_width=True)
 
@@ -584,9 +692,50 @@ st.dataframe(df_regions, use_container_width=True)
 df_baseline_only = df_regions[df_regions["pue"] == baseline_pue_effective].copy()
 plot_bar_by_country(df_baseline_only, f"Emissions by country at PUE={baseline_pue_effective:.2f}")
 
+st.markdown("""
+**Interpretation tip**
+
+- The **height of each bar** shows how much CO₂e would be emitted if your run used the same energy in that country and at the given PUE.
+- Lower bars are better from a climate perspective.
+- Countries with cleaner grids and/or better PUE will show **substantially lower emissions** for the same training run.
+""")
+
 # Multi-PUE sensitivity plot (if more than one PUE)
 if len(pue_scenarios) > 1:
     plot_pue_sensitivity(df_regions, "PUE sensitivity across regions (same energy, different efficiencies)")
+    st.markdown("""
+**PUE sensitivity**
+
+This plot answers: *“If the grid stays the same, how does changing the data-center efficiency (PUE) alone affect emissions?”*
+
+- Moving from **PUE 1.6 → 1.2** reduces overhead energy and therefore emissions.
+- For the same country, bars at lower PUEs should be **consistently lower**.
+""")
+
+# Quick insights block
+df_baseline_only = df_regions[df_regions["pue"] == baseline_pue_effective].copy()
+best_row = df_baseline_only.loc[df_baseline_only["emissions_kg"].idxmin()]
+worst_row = df_baseline_only.loc[df_baseline_only["emissions_kg"].idxmax()]
+reduction_pct = 100.0 * (worst_row["emissions_kg"] - best_row["emissions_kg"]) / worst_row["emissions_kg"]
+
+st.markdown("#### Quick Insights")
+
+st.markdown(
+    f"""
+- **Lowest-emission region (at PUE={baseline_pue_effective:.2f}):** {best_row['country']}  
+  → {best_row['emissions_kg']:.4f} kg CO₂e
+- **Highest-emission region:** {worst_row['country']}  
+  → {worst_row['emissions_kg']:.4f} kg CO₂e
+- **Relative difference:** Running this same training job in {best_row['country']} instead of {worst_row['country']}
+  would reduce the footprint by about **{reduction_pct:.1f}%**.
+"""
+)
+
+st.markdown("""
+You can use these insights in reports or a thesis as a concrete statement, for example:
+
+> “For this model and dataset, choosing a low-carbon region can reduce training emissions by roughly X% without changing the code.”
+""")
 
 # -----------------------------------------------------------
 # Model Performance & Efficiency
@@ -595,7 +744,6 @@ if len(pue_scenarios) > 1:
 if epochs_df is not None and "val_acc" in epochs_df.columns:
     st.markdown("### 5. Model Performance & Carbon Efficiency")
 
-    # Final validation accuracy
     df_acc = epochs_df[epochs_df["val_acc"].notna()]
     final_acc = None
     if not df_acc.empty:
@@ -620,10 +768,14 @@ if epochs_df is not None and "val_acc" in epochs_df.columns:
         else:
             st.metric("kg CO₂e per 1% accuracy", "N/A")
 
-    st.markdown(
-        "This metric helps you evaluate **diminishing returns**: how much extra carbon "
-        "is emitted for each additional percentage point of accuracy."
-    )
+    st.markdown("""
+This metric helps you evaluate **diminishing returns**:
+
+- A **smaller** value of “kg CO₂e per 1% accuracy” means the run is more carbon-efficient.
+- Comparing different runs with this metric shows where extra training or larger models give **tiny accuracy gains** for a **large extra footprint**.
+- In a thesis or report, you can say:  
+  *“In this configuration, each additional percentage point of validation accuracy costs about X kg of CO₂e.”*
+""")
 
     if show_epoch_plots:
         plot_epochs_emissions_and_accuracy(epochs_df, baseline_emissions_kg)
@@ -640,6 +792,14 @@ else:
 
 st.markdown("### 6. Hardware Utilization Over Time")
 
+st.markdown("""
+This plot shows how busy your CPU or GPU was during the run.
+
+- Flat, low utilization (e.g., < 40% most of the time) suggests **wasted capacity** and potentially avoidable emissions.
+- Higher average utilization suggests that hardware was used more efficiently for the same training task.
+- You can use this to argue for optimizing **batch size, data pipeline, or model placement** to reduce idle time.
+""")
+
 if samples_df is not None and show_util_plots:
     plot_utilization(samples_df)
 else:
@@ -647,4 +807,3 @@ else:
         "No `samples.csv` found or utilization plotting disabled. "
         "Upload a bundle with samples.csv to visualize CPU/GPU utilization."
     )
-
