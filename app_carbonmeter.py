@@ -15,7 +15,7 @@ import streamlit as st
 # Basic page config
 # -----------------------------------------------------------
 st.set_page_config(
-    page_title="Smart Carbon Footprint Calculator",
+    page_title="CarbonMindful: Smart Carbon Footprint Calculator for AI Model Training",
     layout="wide",
     initial_sidebar_state="expanded",
 )
